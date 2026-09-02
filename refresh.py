@@ -1,32 +1,36 @@
 """Daily refresh script — runs in GitHub Actions.
 
-Fetches current short-interest and borrow-fee data from public sources,
-recomputes lending scores and APY estimates, and writes data.json.
+Fetches short-interest and borrow-fee data from three public sources that work
+headlessly (no browser required, no API keys):
 
-Zero dependencies beyond `requests` and `beautifulsoup4` (installed in the
-workflow). No Perplexity credits consumed.
+  1. IBorrowDesk /api/stocks          — Interactive Brokers borrow fees
+  2. HighShortInterest.com            — FINRA short-interest %float
+  3. StockAnalysis.com most-shorted   — cross-check on SI% and price
+
+Merges by ticker, recomputes lending scores + APY estimates, writes data.json.
+Includes a fail-safe: refuses to overwrite data.json if the fresh dataset is
+suspiciously small (protects against a source outage wiping the dashboard).
 """
 import json, datetime, re, sys, time, os
 import requests
 from bs4 import BeautifulSoup
 
-# Minimum acceptable freshly-fetched row count. If we get fewer than this,
-# something is wrong upstream and we KEEP the existing data.json untouched.
 MIN_FRESH_ROWS = 40
+FPL_SPLIT = 0.50
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-def fetch(url, retries=3):
+def fetch(url, retries=3, json_mode=False):
     for i in range(retries):
         try:
             r = requests.get(url, headers=HEADERS, timeout=30)
             if r.status_code == 200:
-                return r.text
+                return r.json() if json_mode else r.text
             print(f"  [{r.status_code}] {url}", file=sys.stderr)
         except Exception as e:
             print(f"  [err] {url}: {e}", file=sys.stderr)
@@ -34,103 +38,126 @@ def fetch(url, retries=3):
     return None
 
 # --------------------- Source parsers ---------------------
-# Each returns a list of dicts with any of:
-# ticker, company, si_pct_float, days_to_cover, borrow_fee_pct, price, mkt_cap_m, shares_short_m
 
 def parse_iborrowdesk():
-    """IBorrowDesk homepage — top IBKR borrow fees.
-    Page structure: each stock is a row with symbol, company, fee%, available shares."""
-    html = fetch("https://www.iborrowdesk.com/")
-    if not html: return []
-    soup = BeautifulSoup(html, "html.parser")
+    """IBorrowDesk JSON API — IBKR borrow fees, cleanest source."""
+    data = fetch("https://www.iborrowdesk.com/api/stocks", json_mode=True)
+    if not data or "data" not in data:
+        return []
     rows = []
-    # Try multiple selectors — the page has changed layout historically
-    for tr in soup.select("tr, .stock-row, .row"):
-        tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "div", "span"], recursive=False)]
-        if len(tds) < 2:
-            tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "div", "span"])]
-        if len(tds) < 3: continue
-        m = re.match(r"^([A-Z]{1,6})$", tds[0])
-        if not m: continue
-        # Find a percent-like value anywhere in this row
-        fee = None
-        for cell in tds[1:]:
-            fm = re.search(r"([\d]+\.?\d*)\s*%", cell)
-            if fm:
-                v = float(fm.group(1))
-                if 0.1 < v < 10000:
-                    fee = v
-                    break
-        if fee is None: continue
-        company = tds[1] if len(tds) > 1 and not re.match(r"[\d.]+%", tds[1]) else None
+    for item in data["data"]:
+        # US-listed only (skip .HK, .JP, etc.)
+        if item.get("country") != "usa":
+            continue
+        sym = item.get("symbol", "")
+        if not re.match(r"^[A-Z]{1,5}$", sym):
+            continue
+        fee = item.get("latest_fee")
+        if fee is None:
+            continue
         rows.append({
-            "ticker": m.group(1),
-            "company": company[:60] if company else None,
-            "borrow_fee_pct": fee,
+            "ticker": sym,
+            "company": (item.get("name") or "").title()[:60],
+            "borrow_fee_pct": float(fee),
             "source": "IBorrowDesk (IBKR)",
         })
-    return rows[:80]
+    return rows
 
-def parse_marketwatch():
-    """MarketWatch most-shorted screener."""
-    html = fetch("https://www.marketwatch.com/tools/screener/short-interest")
-    if not html: return []
+def parse_high_short_interest():
+    """HighShortInterest.com — table of SI% of float."""
+    html = fetch("https://www.highshortinterest.com/")
+    if not html:
+        return []
     soup = BeautifulSoup(html, "html.parser")
     rows = []
-    for tr in soup.select("table tr"):
-        tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if len(tds) < 8: continue
-        tk = tds[0].strip()
-        if not re.match(r"^[A-Z]{1,5}$", tk): continue
+    for tr in soup.select("table.stocks tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 6:
+            continue
+        # First cell has an <a>TICKER</a>
+        a = tds[0].find("a")
+        if not a:
+            continue
+        tk = a.get_text(strip=True)
+        if not re.match(r"^[A-Z]{1,5}$", tk):
+            continue
         try:
-            price = float(re.sub(r"[^\d.]", "", tds[2])) if tds[2] else None
-            short_shares = int(re.sub(r"[^\d]", "", tds[6])) if tds[6] else None
-            float_shares = int(re.sub(r"[^\d]", "", tds[7])) if tds[7] else None
-            si_pct = float(re.sub(r"[^\d.]", "", tds[8])) if len(tds) > 8 and tds[8] else None
+            company = tds[1].get_text(strip=True)
+            si_txt = tds[3].get_text(strip=True).replace("%", "")
+            si = float(si_txt) if si_txt else None
+
+            def parse_shares(txt):
+                txt = txt.replace(",", "").strip()
+                m = re.match(r"([\d.]+)\s*([MK]?)", txt)
+                if not m: return None
+                v = float(m.group(1))
+                return v if m.group(2) == "M" else (v / 1000 if m.group(2) == "K" else v / 1e6)
+
+            float_m = parse_shares(tds[4].get_text(strip=True))
+            shares_short_m = (si / 100 * float_m) if (si and float_m) else None
+
             rows.append({
                 "ticker": tk,
-                "company": tds[1][:60],
-                "price": price,
-                "shares_short_m": short_shares / 1e6 if short_shares else None,
-                "si_pct_float": si_pct,
-                "source": "MarketWatch",
+                "company": company[:60],
+                "si_pct_float": si,
+                "shares_short_m": shares_short_m,
+                "source": "HighShortInterest",
             })
         except Exception:
             continue
-    return rows[:80]
+    return rows
 
-def parse_desperate_trader():
-    """TheDesperateTrader — SI% of float leaderboard."""
-    html = fetch("https://thedesperatetrader.com/betting-against")
-    if not html: return []
+def parse_stockanalysis():
+    """StockAnalysis.com — cross-check on SI% and price."""
+    html = fetch("https://stockanalysis.com/list/most-shorted-stocks/")
+    if not html:
+        return []
     soup = BeautifulSoup(html, "html.parser")
     rows = []
-    for tr in soup.select("table tr"):
-        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if len(tds) < 5: continue
-        # First col: "TICKER Company"
-        parts = tds[0].split(" ", 1)
-        if len(parts) < 2 or not re.match(r"^[A-Z]{1,5}$", parts[0]): continue
-        tk = parts[0]
+    # Table cells arrive in groups of 6: rank, company, SI%, price, chg%, volume
+    # But we need the ticker, which is in the row header/link nearby. Look at rows:
+    for tr in soup.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 5:
+            continue
+        # Find ticker in a link or bold text within the row
+        link = tr.find("a", href=re.compile(r"/stocks/[a-z0-9]+/"))
+        if not link:
+            continue
+        m = re.search(r"/stocks/([a-z0-9]+)/", link.get("href", ""))
+        if not m:
+            continue
+        tk = m.group(1).upper()
+        if not re.match(r"^[A-Z]{1,5}$", tk):
+            continue
         try:
-            si = float(re.sub(r"[^\d.]", "", tds[1]))
-            ss_txt = tds[2].replace(",", "")
-            ss_m = None
-            if "M" in ss_txt: ss_m = float(re.sub(r"[^\d.]", "", ss_txt))
-            elif "K" in ss_txt: ss_m = float(re.sub(r"[^\d.]", "", ss_txt)) / 1000
-            dtc = float(re.sub(r"[^\d.]", "", tds[3])) if tds[3] else None
-            price = float(re.sub(r"[^\d.]", "", tds[5])) if len(tds) > 5 and "$" in tds[5] else None
+            texts = [t.get_text(strip=True) for t in tds]
+            si = None
+            price = None
+            for t in texts:
+                if "%" in t and si is None:
+                    v = float(re.sub(r"[^\d.]", "", t))
+                    if 5 < v < 200:  # plausible SI%
+                        si = v
+                elif re.match(r"^[\d.]+$", t) and price is None and 0.01 < float(t) < 10000:
+                    price = float(t)
+            if si is None:
+                continue
+            company = next((t.get_text(strip=True) for t in tds
+                           if len(t.get_text(strip=True)) > 5 and "%" not in t.get_text() and
+                           not re.match(r"^[\d.,]+$", t.get_text(strip=True))), "")
             rows.append({
-                "ticker": tk, "company": parts[1][:60],
-                "si_pct_float": si, "shares_short_m": ss_m,
-                "days_to_cover": dtc, "price": price,
-                "source": "TheDesperateTrader",
+                "ticker": tk,
+                "company": company[:60] if company else None,
+                "si_pct_float": si,
+                "price": price,
+                "source": "StockAnalysis",
             })
         except Exception:
             continue
-    return rows[:60]
+    return rows
 
-# --------------------- Merge & score ---------------------
+# --------------------- Score + merge ---------------------
 
 def fee_tier(fee):
     if fee is None: return "Unknown"
@@ -140,8 +167,6 @@ def fee_tier(fee):
     if fee >= 3:   return "Warm"
     if fee >= 1:   return "General collateral+"
     return "General collateral"
-
-FPL_SPLIT = 0.50
 
 def lending_score(si, dtc, fee, price):
     parts = []
@@ -172,9 +197,7 @@ def flag(fee):
     return "—"
 
 def merge(all_rows):
-    """Merge by ticker — union of fields, preferring non-null values."""
-    merged = {}
-    sources = {}
+    merged, sources = {}, {}
     for r in all_rows:
         tk = r["ticker"]
         src = r.pop("source", "")
@@ -193,9 +216,11 @@ def merge(all_rows):
 def main():
     print("Fetching sources...")
     all_rows = []
-    for name, fn in [("IBorrowDesk", parse_iborrowdesk),
-                      ("MarketWatch", parse_marketwatch),
-                      ("TheDesperateTrader", parse_desperate_trader)]:
+    for name, fn in [
+        ("IBorrowDesk",        parse_iborrowdesk),
+        ("HighShortInterest",  parse_high_short_interest),
+        ("StockAnalysis",      parse_stockanalysis),
+    ]:
         try:
             rows = fn()
             print(f"  {name}: {len(rows)} rows")
@@ -205,7 +230,7 @@ def main():
 
     if len(all_rows) < MIN_FRESH_ROWS:
         print(f"ERROR: only {len(all_rows)} rows fetched (min {MIN_FRESH_ROWS}) — "
-              f"aborting to preserve last-known-good data.json", file=sys.stderr)
+              f"preserving last-known-good data.json", file=sys.stderr)
         sys.exit(1)
 
     merged = merge(all_rows)
@@ -232,14 +257,7 @@ def main():
         })
     records.sort(key=lambda x: (-x["lending_score"], -(x["borrow_fee_pct"] or 0)))
 
-    out = {
-        "generated_at": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
-        "as_of": datetime.date.today().isoformat(),
-        "fpl_split_assumption": FPL_SPLIT,
-        "row_count": len(records),
-        "rows": records,
-    }
-    # Sanity check against previous baseline — refuse to shrink dramatically
+    # Sanity check vs previous baseline
     if os.path.exists("data.json"):
         try:
             with open("data.json") as f:
@@ -247,11 +265,18 @@ def main():
             prev_n = prev.get("row_count", 0)
             if prev_n and len(records) < prev_n * 0.4:
                 print(f"ERROR: new dataset has {len(records)} rows vs {prev_n} baseline — "
-                      f"refusing to overwrite. Sources may be blocked.", file=sys.stderr)
+                      f"preserving previous data.json", file=sys.stderr)
                 sys.exit(1)
         except Exception:
             pass
 
+    out = {
+        "generated_at": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+        "as_of": datetime.date.today().isoformat(),
+        "fpl_split_assumption": FPL_SPLIT,
+        "row_count": len(records),
+        "rows": records,
+    }
     with open("data.json", "w") as f:
         json.dump(out, f, indent=2)
     print(f"Wrote {len(records)} tickers to data.json")
