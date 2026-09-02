@@ -120,38 +120,42 @@ def parse_high_short_interest():
     return rows
 
 def parse_stockanalysis():
-    """StockAnalysis.com most-shorted — cross-check + price."""
+    """StockAnalysis.com most-shorted — cross-check + price + market cap.
+
+    Fixed column layout as of 2026-09:
+      0: No.  1: Symbol  2: Company  3: Short % Float  4: Stock Price  5: % Change  6: Market Cap
+    """
+    def parse_mcap(txt):
+        """Parse '1.57M', '450K', '2.3B' into millions."""
+        txt = txt.strip().replace(",", "")
+        m = re.match(r"([\d.]+)\s*([KMBT]?)", txt)
+        if not m: return None
+        v = float(m.group(1))
+        suf = m.group(2)
+        return {"K": v/1000, "M": v, "B": v*1000, "T": v*1e6}.get(suf, v)
+
     html = fetch("https://stockanalysis.com/list/most-shorted-stocks/")
     if not html: return []
     soup = BeautifulSoup(html, "html.parser")
     rows = []
     for tr in soup.find_all("tr"):
         tds = tr.find_all("td")
-        if len(tds) < 5: continue
-        link = tr.find("a", href=re.compile(r"/stocks/[a-z0-9]+/"))
-        if not link: continue
-        m = re.search(r"/stocks/([a-z0-9]+)/", link.get("href", ""))
-        if not m: continue
-        tk = m.group(1).upper()
-        if not re.match(r"^[A-Z]{1,5}$", tk): continue
+        if len(tds) < 7: continue
         try:
-            texts = [t.get_text(strip=True) for t in tds]
-            si, price = None, None
-            for t in texts:
-                if "%" in t and si is None:
-                    v = float(re.sub(r"[^\d.]", "", t))
-                    if 5 < v < 200: si = v
-                elif re.match(r"^[\d.]+$", t) and price is None and 0.01 < float(t) < 10000:
-                    price = float(t)
-            if si is None: continue
-            company = next((t.get_text(strip=True) for t in tds
-                           if len(t.get_text(strip=True)) > 5 and "%" not in t.get_text() and
-                           not re.match(r"^[\d.,]+$", t.get_text(strip=True))), "")
+            tk = tds[1].get_text(strip=True).upper()
+            if not re.match(r"^[A-Z]{1,5}$", tk): continue
+            company = tds[2].get_text(strip=True)
+            si_txt = tds[3].get_text(strip=True).replace("%", "").replace(",", "")
+            si = float(si_txt) if re.match(r"^[\d.]+$", si_txt) else None
+            price_txt = tds[4].get_text(strip=True).replace(",", "").replace("$", "")
+            price = float(price_txt) if re.match(r"^[\d.]+$", price_txt) else None
+            mcap_m = parse_mcap(tds[6].get_text(strip=True).replace("$", ""))
             rows.append({
                 "ticker": tk,
                 "company": company[:60] if company else None,
                 "si_pct_float": si,
                 "price": price,
+                "mkt_cap_m": mcap_m,
                 "source": "StockAnalysis",
             })
         except Exception:
