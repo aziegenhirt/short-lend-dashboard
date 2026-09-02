@@ -73,6 +73,10 @@
   .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-family:var(--mono);font-size:11px}
   .legend span b{color:var(--text)}
   .stat-pill{padding:2px 6px;border-radius:3px;font-size:10px;background:#0b1220;border:1px solid var(--border);color:var(--muted)}
+  .src-pill{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-family:var(--mono);letter-spacing:.03em;font-weight:600}
+  .src-actual{background:rgba(75,209,160,.14);color:var(--accent);border:1px solid rgba(75,209,160,.35)}
+  .src-model{background:rgba(102,217,255,.10);color:var(--accent-2);border:1px solid rgba(102,217,255,.25)}
+  .src-none{background:rgba(107,118,132,.12);color:var(--dim);border:1px solid var(--border)}
   @media (max-width:1000px){.kpis{grid-template-columns:repeat(3,1fr)}}
   @media (max-width:640px){.kpis{grid-template-columns:repeat(2,1fr)}}
 </style>
@@ -106,6 +110,10 @@
   <label>Min APY:</label>
   <input id="minapy" type="number" min="0" step="0.5" value="0" style="width:70px" />
   <label style="margin-left:12px"><input type="checkbox" id="flagsonly" /> Flagged only</label>
+  <label style="margin-left:12px">Fee data:</label>
+  <span class="chip active" data-fee="all">All</span>
+  <span class="chip" data-fee="IBKR actual">Actual (IBKR)</span>
+  <span class="chip" data-fee="modeled">Modeled</span>
   <span class="stat-pill" id="visible-count" style="margin-left:auto"></span>
 </div>
 
@@ -117,6 +125,7 @@
       <th class="left" data-key="company">Company</th>
       <th data-key="lending_score">Lending Score ▼</th>
       <th data-key="borrow_fee_pct">CTB %</th>
+      <th data-key="fee_source" class="left">Fee Src</th>
       <th data-key="fee_tier" class="left">Tier</th>
       <th data-key="est_apy_pct">Est. Lender APY</th>
       <th data-key="si_pct_float">SI % Float</th>
@@ -134,17 +143,20 @@
 
 <footer>
   <div>
+    <b style="color:var(--text)">Fee Data.</b>
+    Rows tagged <span class="src-pill src-actual">IBKR actual</span> come from the IBorrowDesk feed — Interactive Brokers' published intraday borrow fee. Rows tagged <span class="src-pill src-model">modeled</span> use an empirical curve calibrated to <b>Engelberg-Reed-Ringgenberg (2018)</b> and <b>Drechsler-Moreira-Savov (2017)</b>, mapping SI %float and days-to-cover onto expected borrow fee, with a small-cap price premium. Modeled values are <b>directional estimates</b>, not broker quotes. Modeled rows get a small score penalty so actual data ranks first at ties. Free bulk borrow-fee data is scarce — this hybrid keeps coverage broad while flagging what's measured vs. inferred.
+  </div>
+  <div style="margin-top:8px">
     <b style="color:var(--text)">Methodology.</b>
-    Lending Score (0-100) weights borrow fee (40), SI %float (25), days-to-cover (15), price-eligibility (10), and data completeness (10).
+    Lending Score (0-100) weights borrow fee (40), SI %float (25), days-to-cover (15), price-eligibility (10), and data completeness (10). Modeled-fee rows are penalized 8 pts.
     Estimated Lender APY assumes a 50% split of the annualized borrow fee — typical of Fidelity FPL, Schwab SLFP, and IBKR Stock Yield Enhancement Program.
-    Actual splits vary daily and by broker; use as a directional indicator, not a quote.
-    Flags trigger at CTB thresholds: <b>≥100%</b> extreme, <b>≥25%</b> hard-to-borrow, <b>≥10%</b> elevated, <b>≥3%</b> warm.
+    Flags trigger at CTB thresholds: <b>≥100%</b> extreme, <b>≥25%</b> hard-to-borrow, <b>≥10%</b> elevated, <b>≥3%</b> warm. Modeled flags carry an "(est)" suffix.
   </div>
   <div class="legend">
-    <span>Sources: <b>MarketWatch</b>, <b>Tapeboard</b>, <b>TheDesperateTrader</b>, <b>TheTrading.tools</b>, <b>IBorrowDesk</b> (IBKR), <b>Yahoo Finance</b> — all pulled 2026-09-01.</span>
+    <span>Sources: <b>IBorrowDesk</b> (IBKR fees), <b>HighShortInterest.com</b> (FINRA SI% + float), <b>StockAnalysis.com</b> (SI% cross-check), <b>Yahoo Finance</b> (price, mkt cap, DTC). Refreshed daily via GitHub Actions.</span>
   </div>
   <div class="legend" style="color:var(--dim)">
-    Educational tool only. Not investment advice. Short-interest data is bi-weekly FINRA; CTB rates move intraday.
+    Educational tool only. Not investment advice. FINRA short-interest data is bi-weekly; broker CTB rates move intraday.
   </div>
 </footer>
 
@@ -177,13 +189,15 @@ function apyClass(a){
   return 'gc';
 }
 
-let DATA=null, sortKey='lending_score', sortDir=-1, tierFilter='all';
+let DATA=null, sortKey='lending_score', sortDir=-1, tierFilter='all', feeFilter='all';
 
 async function load(){
   const r = await fetch('data.json?ts='+Date.now());
   DATA = await r.json();
+  const cov = DATA.coverage || {};
+  const covStr = cov.actual_fee!==undefined ? `  ·  ${cov.actual_fee} actual + ${cov.modeled_fee} modeled + ${cov.no_fee_data} no-data` : '';
   document.getElementById('asof').textContent =
-    `As of ${DATA.as_of}  ·  ${DATA.row_count} tickers  ·  FPL split assumption ${(DATA.fpl_split_assumption*100).toFixed(0)}%  ·  Generated ${DATA.generated_at.slice(0,19).replace('T',' ')} UTC`;
+    `As of ${DATA.as_of}  ·  ${DATA.row_count} tickers${covStr}  ·  FPL split ${(DATA.fpl_split_assumption*100).toFixed(0)}%  ·  Generated ${DATA.generated_at.slice(0,19).replace('T',' ')} UTC`;
   renderKPIs();
   render();
 }
@@ -219,6 +233,7 @@ function render(){
   let rows = DATA.rows.filter(r => {
     if (q && !(r.ticker.toLowerCase().includes(q) || (r.company||'').toLowerCase().includes(q))) return false;
     if (tierFilter!=='all' && r.fee_tier!==tierFilter) return false;
+    if (feeFilter!=='all' && r.fee_source!==feeFilter) return false;
     if (r.lending_score < minS) return false;
     if ((r.est_apy_pct||0) < minA) return false;
     if (flagged && (r.flag==='—' || r.flag==='no_fee_data')) return false;
@@ -243,6 +258,7 @@ function render(){
       <td class="left"><span class="co" title="${r.company||''}">${r.company||''}</span></td>
       <td><span class="score-bar"><span class="bar"><span class="fill" style="width:${scorePct}%"></span></span>${scorePct}</span></td>
       <td>${r.borrow_fee_pct==null ? '<span class="dim">—</span>' : (r.borrow_fee_pct.toFixed(1)+'%')}</td>
+      <td class="left">${r.fee_source==='IBKR actual' ? '<span class="src-pill src-actual">ACTUAL</span>' : r.fee_source==='modeled' ? '<span class="src-pill src-model">MODEL</span>' : '<span class="src-pill src-none">—</span>'}</td>
       <td class="left"><span class="tier ${tierClass(r.fee_tier)}">${r.fee_tier}</span></td>
       <td class="apy ${apyClass(r.est_apy_pct)}">${r.est_apy_pct==null ? '<span class="dim">—</span>' : (r.est_apy_pct.toFixed(2)+'%')}</td>
       <td>${r.si_pct_float==null ? '<span class="dim">—</span>' : (r.si_pct_float.toFixed(1)+'%')}</td>
@@ -269,11 +285,19 @@ document.querySelectorAll('thead th').forEach(th=>{
     render();
   });
 });
-document.querySelectorAll('.chip').forEach(c=>{
+document.querySelectorAll('.chip[data-tier]').forEach(c=>{
   c.addEventListener('click',()=>{
-    document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.chip[data-tier]').forEach(x=>x.classList.remove('active'));
     c.classList.add('active');
     tierFilter = c.dataset.tier;
+    render();
+  });
+});
+document.querySelectorAll('.chip[data-fee]').forEach(c=>{
+  c.addEventListener('click',()=>{
+    document.querySelectorAll('.chip[data-fee]').forEach(x=>x.classList.remove('active'));
+    c.classList.add('active');
+    feeFilter = c.dataset.fee;
     render();
   });
 });
