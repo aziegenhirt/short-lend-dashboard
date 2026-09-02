@@ -29,19 +29,28 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def fetch(url, retries=3, json_mode=False, timeout=30):
+def fetch(url, retries=3, json_mode=False, timeout=30, fast_fail=False):
+    """HTTP GET with retries. fast_fail=True: give up immediately on 429/403 (for Yahoo)."""
     for i in range(retries):
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout)
             if r.status_code == 200:
                 return r.json() if json_mode else r.text
+            if r.status_code in (429, 403) and fast_fail:
+                return None  # don't burn workflow time on rate-limited endpoints
             if r.status_code == 429:
                 time.sleep(3 * (i + 1))
                 continue
-            print(f"  [{r.status_code}] {url}", file=sys.stderr)
+            if not fast_fail:
+                print(f"  [{r.status_code}] {url}", file=sys.stderr)
+            return None
         except Exception as e:
-            print(f"  [err] {url}: {e}", file=sys.stderr)
-        time.sleep(2 * (i + 1))
+            if not fast_fail:
+                print(f"  [err] {url}: {e}", file=sys.stderr)
+        if not fast_fail:
+            time.sleep(2 * (i + 1))
+        else:
+            return None
     return None
 
 # --------------------- Source parsers ---------------------
@@ -149,20 +158,34 @@ def parse_stockanalysis():
             continue
     return rows
 
-def enrich_yahoo(tickers, max_tickers=60):
-    """Per-ticker Yahoo Finance JSON for price, mkt cap, DTC. Rate-limited politely.
+def enrich_yahoo(tickers, max_tickers=40, max_seconds=120):
+    """Per-ticker Yahoo Finance enrichment. Best-effort: cap by count AND wall-clock.
 
-    Yahoo returns 429 if hit too fast, so we cap to max_tickers and pace calls.
-    We prioritize the highest-SI names since those matter most for the dashboard.
+    Yahoo aggressively rate-limits from GitHub Actions IPs. We use fast_fail so
+    failed calls return instantly (~0.5s each), and we exit the loop once we hit
+    max_seconds so a bad-IP day can't stall the workflow. Modeled fees don't
+    require Yahoo data — they work off SI% alone, so Yahoo enrichment is a
+    quality bonus rather than a blocker.
     """
     out = {}
     seen = 0
+    consecutive_fails = 0
+    start = time.time()
     for tk in tickers:
         if seen >= max_tickers: break
+        if time.time() - start > max_seconds:
+            print(f"  Yahoo: hit {max_seconds}s wall-clock cap, stopping")
+            break
+        if consecutive_fails >= 8:
+            print(f"  Yahoo: 8 consecutive fails — IP likely blocked, stopping")
+            break
         url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{tk}?modules=defaultKeyStatistics,summaryDetail,price"
-        data = fetch(url, retries=2, json_mode=True, timeout=15)
+        data = fetch(url, retries=1, json_mode=True, timeout=8, fast_fail=True)
+        seen += 1
         if not data:
+            consecutive_fails += 1
             continue
+        consecutive_fails = 0
         try:
             r = data["quoteSummary"]["result"][0]
             ks = r.get("defaultKeyStatistics", {})
@@ -175,9 +198,8 @@ def enrich_yahoo(tickers, max_tickers=60):
             }
         except Exception:
             pass
-        seen += 1
-        time.sleep(0.4)  # ~2.5 req/sec, well under Yahoo's rate limit
-    print(f"  Yahoo enrich: {len(out)}/{seen} tickers succeeded")
+        time.sleep(0.3)
+    print(f"  Yahoo enrich: {len(out)}/{seen} tickers succeeded ({int(time.time()-start)}s)")
     return out
 
 # --------------------- Modeled borrow fee ---------------------
@@ -318,10 +340,11 @@ def main():
 
     merged = merge(all_rows)
 
-    # Enrich top-SI tickers with Yahoo Finance price/mcap/DTC (~60 calls, ~30s)
+    # Best-effort Yahoo Finance enrichment for top-SI tickers (price, mcap, DTC).
+    # Bounded by wall-clock and consecutive-fails so a Yahoo IP block can't hang the workflow.
     top_by_si = sorted(merged, key=lambda r: -(r.get("si_pct_float") or 0))
-    top_tickers = [r["ticker"] for r in top_by_si[:60]]
-    print(f"Enriching top {len(top_tickers)} high-SI tickers with Yahoo Finance...")
+    top_tickers = [r["ticker"] for r in top_by_si[:40]]
+    print(f"Enriching top {len(top_tickers)} high-SI tickers with Yahoo Finance (best-effort)...")
     y = enrich_yahoo(top_tickers)
     for r in merged:
         tk = r["ticker"]
